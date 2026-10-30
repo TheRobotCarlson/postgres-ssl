@@ -246,6 +246,71 @@ Operator-facing env contract:
 | `WAL_BACKUP_RETENTION_DIFF` | differentials kept by `pgbackrest expire` (default `14`) |
 | `WAL_BACKUP_STALL_SECONDS` | a running base backup whose reported progress has not advanced for this long is killed and retried (default `1800`; the window grows with backup size so large backups are never cut between progress updates; `0` disables) |
 
+### Optional backup and PITR repository encryption
+
+Encryption is **off by default** (`none`). To encrypt backups and archived WAL
+before they leave the database container, configure the archive repository
+**before its first stanza is created**:
+
+```dotenv
+WAL_ARCHIVE_CIPHER_TYPE=aes-256-cbc
+WAL_ARCHIVE_CIPHER_PASS=<strong-random-passphrase-stored-as-a-secret>
+```
+
+For a PITR restore, provide the source repository's cipher and passphrase:
+
+```dotenv
+WAL_RECOVER_FROM_CIPHER_TYPE=aes-256-cbc
+WAL_RECOVER_FROM_CIPHER_PASS=<source-repository-passphrase>
+```
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `WAL_ARCHIVE_CIPHER_TYPE` | `none` | `none` or `aes-256-cbc` for this service's backup/WAL repository. |
+| `WAL_ARCHIVE_CIPHER_PASS` | unset | Required when archive encryption is enabled. |
+| `WAL_RECOVER_FROM_CIPHER_TYPE` | `none` | `none` or `aes-256-cbc` for the source repository read during restore and WAL replay. |
+| `WAL_RECOVER_FROM_CIPHER_PASS` | unset | Required when recovery-source encryption is enabled; must match the source repository. |
+
+Archive and recovery keys are independent: a restored fork can decrypt its
+source's backups/WAL while encrypting new backups/WAL with its own key, or
+leave new archiving unencrypted. A passphrase without an enabled cipher, an
+unsupported cipher, a missing required passphrase, or a multiline passphrase
+refuses startup for the configured role. Passphrases are written only to the
+postgres-owned, mode `0640` pgBackRest config files and are not logged. Store
+them in secret variables and retain recovery copies separately from the bucket.
+
+The image-managed settings take precedence over native
+`PGBACKREST_REPO1_CIPHER_TYPE` / `PGBACKREST_REPO1_CIPHER_PASS` when either
+`WAL_*_CIPHER_TYPE` is explicitly set. This prevents a process-wide override
+from applying the archive key to the separate recovery config. Existing native
+options are preserved when neither image-managed cipher type is set.
+
+This is pgBackRest **client-side repository encryption**. It covers backup data
+and archived WAL used for PITR; it does not encrypt the running database volume,
+local WAL, or establish the bucket provider's server-side encryption policy.
+The repository's encryption settings cannot be changed in place after stanza
+creation. To enable encryption for an existing unencrypted archive, use a new
+repository prefix or bucket and establish a new full backup plus WAL history;
+retain the old repository and its settings for its existing recovery window.
+See [pgBackRest repository encryption](https://pgbackrest.org/user-guide.html#quickstart/configure-encryption).
+
+The E2E suite tests encrypted backup/WAL bytes, missing and wrong keys,
+point-in-time replay, independent fork keys, and the unencrypted default.
+To run the same test against an existing **disposable** S3-compatible bucket:
+
+```sh
+python3 test/encryption.py --image postgres-ssl-pitr:17 \
+  --s3-credentials /private/path/credentials.json
+```
+
+The private JSON file contains `endpoint`, `bucketName`, `region`, `accessKeyId`,
+`secretAccessKey`, and `urlStyle` (`path` or `virtual-host`). The test uses the
+MinIO client image built by `test/Dockerfile.minio`. It writes synthetic data
+under a unique prefix, retains remote objects for inspection, and removes its
+local containers and volumes. It never deletes pre-existing bucket contents.
+The unencrypted-default control runs only against disposable local MinIO;
+remote validation writes only encrypted repositories to the supplied bucket.
+
 Image-level tuning knobs:
 
 | Env var | Purpose |
