@@ -87,13 +87,19 @@ class Qualification:
         return "test/" + self.storage["bucketName"]
 
     def mc(self, *args, check=True, binary=False):
-        return self.command(
-            "run", "--rm", "--network", self.network, "--env-file", self.s3_env,
-            "--entrypoint", "sh", self.args.storage_image, "-ec",
-            'mc alias set test "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" '
-            '--path "$S3_PATH" >/dev/null; exec mc "$@"', "mc", *args,
-            check=check, binary=binary,
-        )
+        name = self.identifier + "-client-" + uuid.uuid4().hex[:8]
+        try:
+            return self.command(
+                "run", "--rm", "--name", name, "--network", self.network,
+                "--env-file", self.s3_env, "--entrypoint", "sh",
+                self.args.storage_image, "-ec",
+                'mc alias set test "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" '
+                '--path "$S3_PATH" >/dev/null; exec mc "$@"', "mc", *args,
+                check=check, binary=binary,
+            )
+        finally:
+            # Killing a timed-out Docker client does not kill its container.
+            self.command("rm", "-f", name, check=False)
 
     def role(self, prefix, path, key=None):
         values = {
