@@ -116,11 +116,15 @@ class Qualification:
             values[prefix + "_CIPHER_PASS"] = key
         return values
 
-    def start(self, suffix, values):
-        name = self.identifier + "-" + suffix
-        volume = name + "-data"
+    def new_volume(self, suffix):
+        volume = self.identifier + "-" + suffix + "-data"
         self.volumes.append(volume)
         self.command("volume", "create", volume)
+        return volume
+
+    def start(self, suffix, values, volume=None):
+        name = self.identifier + "-" + suffix
+        volume = volume or self.new_volume(suffix)
         self.containers.append(name)
         values = {
             "POSTGRES_HOST_AUTH_METHOD": "trust", "WAL_HEARTBEAT_DISABLED": "1",
@@ -135,6 +139,43 @@ class Qualification:
                      "--env-file", env, "-v", volume + ":/var/lib/postgresql/data",
                      self.args.image)
         return name
+
+    def external_restore(self, suffix, source_path):
+        """Pre-populate PGDATA before the image boots, as an external restore does."""
+        volume = self.new_volume(suffix)
+        env = self.env_file(suffix + "-restore", {
+            "PGBACKREST_REPO1_TYPE": "s3",
+            "PGBACKREST_REPO1_PATH": source_path,
+            "PGBACKREST_REPO1_S3_BUCKET": self.storage["bucketName"],
+            "PGBACKREST_REPO1_S3_ENDPOINT": self.storage["endpoint"],
+            "PGBACKREST_REPO1_S3_REGION": self.storage["region"],
+            "PGBACKREST_REPO1_S3_KEY": self.storage["accessKeyId"],
+            "PGBACKREST_REPO1_S3_KEY_SECRET": self.storage["secretAccessKey"],
+            "PGBACKREST_REPO1_S3_URI_STYLE": "path" if self.storage["urlStyle"] == "path" else "host",
+            "PGBACKREST_REPO1_CIPHER_TYPE": "aes-256-cbc",
+            "PGBACKREST_REPO1_CIPHER_PASS": self.archive_key,
+            "PGBACKREST_PROCESS_MAX": "8",
+        })
+        name = self.identifier + "-external-restore"
+        try:
+            self.command(
+                "run", "--rm", "--name", name, "--network", self.network,
+                "--env-file", env, "-v", volume + ":/var/lib/postgresql/data",
+                "--entrypoint", "bash", self.args.image, "-euc",
+                'install -d -m 0700 -o postgres -g postgres /var/lib/postgresql/data; '
+                'gosu postgres pgbackrest --stanza=main --pg1-path=/var/lib/postgresql/data '
+                '--recovery-option="restore_command=pgbackrest '
+                '--config=/etc/pgbackrest/pgbackrest-recovery-source.conf '
+                '--stanza=main archive-get %f %p" restore; '
+                'test -f /var/lib/postgresql/data/PG_VERSION; '
+                'test -f /var/lib/postgresql/data/global/pg_control; '
+                'test ! -f /var/lib/postgresql/data/.pgbackrest_restored; '
+                'test "$(cat /var/lib/postgresql/data/.pgbackrest_repo_path)" = "$PGBACKREST_REPO1_PATH"',
+                timeout=300 if self.args.s3_credentials else 90,
+            )
+        finally:
+            self.command("rm", "-f", name, check=False)
+        return volume
 
     def sql(self, name, sql, check=True):
         result = self.command("exec", "-u", "postgres", name, "psql", "-h", "127.0.0.1",
@@ -188,6 +229,15 @@ class Qualification:
 
     def run(self):
         self.setup()
+        for suffix, key in [("leading-space-key", " " + self.archive_key),
+                            ("trailing-space-key", self.archive_key + " ")]:
+            invalid = self.start(suffix, self.role("WAL_ARCHIVE", self.prefix + "/invalid", key))
+            self.until(lambda: self.command("inspect", "-f", "{{.State.Status}}", invalid).strip() == "exited")
+            assert self.command("inspect", "-f", "{{.State.ExitCode}}", invalid).strip() != "0"
+            logs = self.command("logs", invalid, check=False)
+            assert "must not begin or end with whitespace" in logs.stdout + logs.stderr
+            assert self.archive_key not in logs.stdout + logs.stderr
+        print("PASS: surrounding-whitespace keys refuse startup without disclosing or trimming the key", flush=True)
         source = self.start("source", self.role("WAL_ARCHIVE", self.prefix + "/source", self.archive_key))
         self.ready(source)
         self.full_backup(source)
@@ -236,6 +286,25 @@ class Qualification:
         self.ready(fork)
         assert self.sql(fork, "SELECT count(*) FROM encryption_proof") == "2"
         print("PASS: PITR replays encrypted WAL, excludes post-target row, archives with independent key, survives restart", flush=True)
+        snapshot_volume = self.external_restore("snapshot", source_path)
+        snapshot = self.start("snapshot", {
+            **self.role("WAL_RECOVER_FROM", source_path, self.archive_key),
+            **self.role("WAL_ARCHIVE", self.prefix + "/snapshot", self.fork_key),
+            "POSTGRES_RECOVERY_TARGET_TIME": target,
+        }, volume=snapshot_volume)
+        self.ready(snapshot)
+        assert self.sql(snapshot, "SELECT pg_is_in_recovery()") == "f"
+        assert self.sql(snapshot, "SELECT string_agg(marker, ',') FROM encryption_proof") == "before-target"
+        self.full_backup(snapshot)
+        snapshot_path = self.command("exec", snapshot, "cat", "/var/lib/postgresql/data/.pgbackrest_repo_path").strip()
+        assert snapshot_path.startswith(self.prefix + "/snapshot/")
+        self.ciphertext(snapshot_path)
+        assert source_metadata == self.mc("cat", self.bucket + source_path + "/backup/main/backup.info", binary=True)
+        self.command("restart", "--time", "20", snapshot)
+        self.ready(snapshot)
+        assert self.sql(snapshot, "SELECT string_agg(marker, ',') FROM encryption_proof") == "before-target"
+        assert self.command("exec", snapshot, "cat", "/var/lib/postgresql/data/.pgbackrest_repo_path").strip() == snapshot_path
+        print("PASS: external/snapshot restore discards copied source path, uses independent archive key and preserves its path across restart", flush=True)
         if not self.args.s3_credentials:
             # Keep the unencrypted control local; remote validation writes
             # only encrypted repositories to the supplied bucket.

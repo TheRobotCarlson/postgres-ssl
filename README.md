@@ -274,8 +274,12 @@ WAL_RECOVER_FROM_CIPHER_PASS=<source-repository-passphrase>
 Archive and recovery keys are independent: a restored fork can decrypt its
 source's backups/WAL while encrypting new backups/WAL with its own key, or
 leave new archiving unencrypted. A passphrase without an enabled cipher, an
-unsupported cipher, a missing required passphrase, or a multiline passphrase
-refuses startup for the configured role. Passphrases are written only to the
+unsupported cipher, a missing required passphrase, a multiline passphrase, or
+leading/trailing whitespace refuses startup for the configured role. The
+whitespace restriction prevents pgBackRest's INI parser from silently trimming
+the key. Existing repositories whose keys contain surrounding whitespace must
+keep using pgBackRest's native settings; do not trim or change their keys.
+Passphrases are written only to the
 postgres-owned, mode `0640` pgBackRest config files and are not logged. Store
 them in secret variables and retain recovery copies separately from the bucket.
 
@@ -289,9 +293,27 @@ This is pgBackRest **client-side repository encryption**. It covers backup data
 and archived WAL used for PITR; it does not encrypt the running database volume,
 local WAL, or establish the bucket provider's server-side encryption policy.
 The repository's encryption settings cannot be changed in place after stanza
-creation. To enable encryption for an existing unencrypted archive, use a new
-repository prefix or bucket and establish a new full backup plus WAL history;
-retain the old repository and its settings for its existing recovery window.
+creation. To enable encryption for an existing unencrypted archive:
+
+1. Record the old bucket, effective repository path (from
+   `$PGDATA/.pgbackrest_repo_path`), and credentials. Retain its backups/WAL and
+   settings for its existing recovery window.
+2. Provision a **new empty bucket**. Update `WAL_ARCHIVE_BUCKET` and its
+   connection credentials plus the new cipher settings, then redeploy. Keep
+   the existing path marker and `WAL_ARCHIVE_PATH` unchanged. Changing only
+   `WAL_ARCHIVE_PATH` does not migrate an initialized volume: its persisted
+   marker is authoritative. Do not delete live archive markers to force a move.
+3. Wait for `pgbackrest: stanza-create completed`. Run
+   `gosu postgres pgbackrest --stanza=main --type=full backup` in the container;
+   the existing backup schedule's state is not evidence of a backup in the new
+   bucket. Then run `gosu postgres pgbackrest --stanza=main check` and
+   `gosu postgres pgbackrest --stanza=main info` and qualify a restore from the
+   new repository. Its recovery window begins with the new full backup and
+   continuous WAL history; the old repository retains its earlier window.
+
+Fresh empty-volume and snapshot/external restores discard the source's copied
+archive markers/state during their initial handoff. Replay retries and ordinary
+restarts retain the fork's own archive path, including watcher-created paths.
 See [pgBackRest repository encryption](https://pgbackrest.org/user-guide.html#quickstart/configure-encryption).
 
 The E2E suite tests encrypted backup/WAL bytes, missing and wrong keys,

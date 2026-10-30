@@ -1146,6 +1146,12 @@ pgbackrest_cipher_config() {
         echo "pgbackrest: ${pass_var} must be a single line" >&2
         return 1
       fi
+      # pgBackRest trims INI values, unlike native environment values.
+      # Reject rather than silently encrypt/decrypt with a different key.
+      if [[ "$cipher_pass" == [[:space:]]* || "$cipher_pass" == *[[:space:]] ]]; then
+        echo "pgbackrest: ${pass_var} must not begin or end with whitespace" >&2
+        return 1
+      fi
       ;;
     *)
       echo "pgbackrest: ${type_var} must be none or aes-256-cbc" >&2
@@ -1452,6 +1458,21 @@ bootstrap_pgbackrest_stanza() {
 # (translated from `WAL_RECOVER_FROM_*` at the top of this script). Post-
 # promote archive_command writes to repo1 (this fork's own bucket) — see
 # the archive-push wrapper's --repo=1 pin.
+reset_pgbackrest_archive_state_after_restore() {
+  # These files belong to the source repository, not the restored fork.
+  # Recovery has its own config; new archiving must use the fork's settings.
+  rm -f "$PGBACKREST_REPO_PATH_MARKER" "$PGBACKREST_REPO_ANCHOR_FILE" \
+    "$PGDATA/.pgbackrest_backup_state" "$PGDATA/.pgbackrest_gap_pending"
+}
+
+prepare_pgbackrest_snapshot_archive() {
+  # Only the first staging of an external/snapshot restore is a handoff.
+  # Replay retries must retain any archive paths/state established by this
+  # fork (including watcher migrations), rather than reset on every boot.
+  [ -f "$PITR_STAGING_FILE" ] && return 0
+  reset_pgbackrest_archive_state_after_restore
+}
+
 configure_pgbackrest_recovery() {
   [ -z "${WAL_RECOVER_FROM_BUCKET:-}" ] && return 0
   [ -z "$POSTGRES_RECOVERY_TARGET_TIME" ] && return 0
@@ -1573,6 +1594,7 @@ EOF
     return 0
   fi
 
+  prepare_pgbackrest_snapshot_archive
   ensure_pg_includes_confd
   install -d -m 0750 -o postgres -g postgres "$PGBACKREST_CONFD_DIR"
 
@@ -1616,6 +1638,9 @@ EOF
   chmod 0640 "$PGBACKREST_RECOVERY_CONF"
   touch "$PGDATA/recovery.signal"
   touch "$PITR_STAGING_FILE"
+  # Commit the handoff before Postgres/archiver/watcher can establish new
+  # state. A crash during replay must not repeat the source-state reset.
+  sync "$PITR_STAGING_FILE" 2>/dev/null || sync
   echo "pgbackrest: PITR replay staged (target=${POSTGRES_RECOVERY_TARGET_TIME})"
 }
 
@@ -1775,22 +1800,11 @@ EOF
   # the two repositories share a bucket and use different encryption keys.
   # Clear before publishing the restored marker so an interrupted restore
   # retries this handoff rather than trusting the source's destination.
-  rm -f "$PGBACKREST_REPO_PATH_MARKER" "$PGBACKREST_REPO_ANCHOR_FILE"
+  reset_pgbackrest_archive_state_after_restore
 
   touch "$PGBACKREST_RESTORED_MARKER"
   chown postgres:postgres "$PGBACKREST_RESTORED_MARKER" 2>/dev/null || true
 
-  # pgbackrest restore copies ALL of PGDATA — including the source's
-  # watcher state (`.pgbackrest_backup_state` with source's last_full_at,
-  # last_full_failed_count) and any in-flight gap-recovery marker. On
-  # the fork's own bucket those values are meaningless and they cause
-  # the watcher to mis-detect: source's last_full_at makes
-  # NEEDS_INITIAL_BACKUP skip even though the fork's bucket is empty,
-  # while source's last_full_failed_count vs fork's fresh failed_count
-  # triggers a phantom gap-recovery cycle that blocks the watcher's
-  # actual first full. Wipe so the fork starts from a clean slate.
-  rm -f "$PGDATA/.pgbackrest_backup_state" 2>/dev/null || true
-  rm -f "$PGDATA/.pgbackrest_gap_pending" 2>/dev/null || true
 
   echo "pgbackrest: restore complete; postgres will replay forward to ${POSTGRES_RECOVERY_TARGET_TIME} and promote on first start"
 }
