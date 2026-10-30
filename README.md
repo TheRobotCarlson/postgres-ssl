@@ -149,9 +149,8 @@ user-parsing symbols in the inspected old helper and none in the replacement.
 The checked replacement matches the local Postgres 17 image's helper SHA-256,
 `c03d596db1283b3a418e852ad874343c2b775547e84816beabad2af183e575f8`.
 
-When updating gosu or Go, update the pins in every `Dockerfile.*` and the expected
-version in `test/gosu.sh`. Build the images and run `bash test/gosu.sh IMAGE` plus
-the existing database and upgrade E2E suites before publishing.
+When updating gosu or Go, update the pins in every `Dockerfile.*`. Build the
+images and run the existing database and upgrade E2E suites before publishing.
 
 ### Base distro
 
