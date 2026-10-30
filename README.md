@@ -106,6 +106,27 @@ target server with the same preload list the volume had, so an installed
 pgaudit passes `--check`, and the upgraded database boots with it preloaded
 again.
 
+### gosu helper
+
+Every runtime and upgrade image replaces the base image's prebuilt `gosu` with
+gosu 1.20, built from checksum-verified upstream source at commit
+`29b939aa5bd4dc588af765b8248f6e39150d2565` using Go 1.27.2. Both the source and
+the multi-platform builder image are pinned. The statically linked helper keeps
+the upstream user-switch and exec interface; the Go compiler and build sources
+stay in the build stage. Updating Debian packages alone cannot patch the Go
+standard library embedded in the base image's helper.
+
+This follows the helper rebuild qualified in
+[Truer-Health/infra#14](https://github.com/Truer-Health/infra/pull/14). Its October
+29, 2026 baseline tracked seven advisory groups against the embedded Go 1.24.6
+stdlib: CVE-2025-68121, CVE-2026-39821, CVE-2026-42505, CVE-2026-56857,
+CVE-2026-78663, CVE-2026-78669 and CVE-2026-97031. These are component matches;
+they do not establish that the affected functions are reachable through gosu.
+
+When updating gosu or Go, update the pins in every `Dockerfile.*` and the expected
+version in `test/gosu.sh`. Build the images and run `bash test/gosu.sh IMAGE` plus
+the existing database and upgrade E2E suites before publishing.
+
 ### Base distro
 
 Every `Dockerfile.<major>` (and `Dockerfile.upgrade`) builds `FROM

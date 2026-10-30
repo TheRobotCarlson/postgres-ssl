@@ -54,6 +54,10 @@ jobs:
           cache-from: type=gha,scope=pg${{ matrix.pg_version }}
           cache-to: type=gha,scope=pg${{ matrix.pg_version }},mode=max
 
+      - name: Check gosu privilege switching
+        shell: bash
+        run: bash test/gosu.sh postgres-ssl-pitr:${{ matrix.pg_version }}
+
       - name: Run e2e harness
         shell: bash
         env:
